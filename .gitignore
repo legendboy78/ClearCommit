@@ -1,0 +1,17 @@
+# Secrets — never commit
+.env
+
+# Local runtime artifacts
+logs/
+__pycache__/
+*.pyc
+*.wav
+temp/
+output/
+
+# Pre-change snapshots
+backup_*/
+
+# OS / editor noise
+Desktop.ini
+Thumbs.db
