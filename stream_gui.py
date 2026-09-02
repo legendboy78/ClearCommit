@@ -29,13 +29,20 @@ from config import (
     GROQ_TRANSLATE_MODELS,
     SUPPORTED_LANGUAGES,
     Settings,
+    app_data_dir,
     select_realtime_tts_backend,
 )
 from logger import attach_session_file, configure_root, get_logger
+from setup_wizard import keys_present
 from stream import build_arg_parser
 from stream_pipeline import StreamingInterpreter
 
 logger = get_logger("stream_gui")
+
+APP_VERSION = "1.0.0"
+_RELEASES_API = "https://api.github.com/repos/legendboy78/Voice-end-to-end/releases/latest"
+# One-slot handoff from the update-check thread to the UI tick.
+_UPDATE_INFO = {"tag": None, "url": None}
 
 APP_NAME = "LiveInterpreter"
 _MUTEX_NAME = f"Global\\{APP_NAME}_SingleInstance"
@@ -74,6 +81,32 @@ def _disable_console_quickedit() -> None:
         pass
 
 
+def _check_update_async() -> None:
+    """Fire-and-forget update check -> UI toast when a newer release exists.
+
+    Point _RELEASES_API at a repo with public releases; a private/offline
+    repo simply 404s and this silently does nothing.
+    """
+    import json
+    import urllib.request
+
+    def work():
+        try:
+            req = urllib.request.Request(
+                _RELEASES_API, headers={"User-Agent": "LiveInterpreter"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.load(resp)
+            tag = str(data.get("tag_name", "")).lstrip("v")
+            if tag and tag.split(".") > APP_VERSION.split("."):
+                _UPDATE_INFO["tag"] = tag
+                _UPDATE_INFO["url"] = data.get("html_url", "")
+        except Exception:  # noqa: BLE001 - offline is perfectly fine
+            pass
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 def _sweep_stale_temp() -> None:
     """Delete leftover tmp*.wav utterance files from crashed old sessions."""
     try:
@@ -105,8 +138,9 @@ def _code_from_label(label: str) -> str:
 
 
 def _settings_path() -> Path:
-    base = os.environ.get("APPDATA") or str(Path.home())
-    return Path(base) / APP_NAME / "settings.json"
+    from config import app_data_dir
+
+    return app_data_dir() / "settings.json"
 
 
 def load_settings() -> dict:
@@ -118,6 +152,12 @@ def load_settings() -> dict:
         return data if isinstance(data, dict) else {}
     except Exception:  # noqa: BLE001 - missing/corrupt file = defaults
         return {}
+
+
+def mark_setup_complete() -> None:
+    data = load_settings()
+    data["wizard_done"] = True
+    save_settings(data)
 
 
 def save_settings(data: dict) -> None:
@@ -198,6 +238,13 @@ class ControlBox:
             self._drain_ui_calls()
             self._tick_count += 1
 
+            if _UPDATE_INFO["tag"] and not getattr(self, "_update_shown", False):
+                self._update_shown = True
+                self.show_error(
+                    f"Update v{_UPDATE_INFO['tag']} available — "
+                    f"download: {_UPDATE_INFO['url']}"
+                )
+
             # HUD show/hide (Tk calls the minimized state "iconic").
             try:
                 state = self.root.state()
@@ -242,6 +289,9 @@ class ControlBox:
         if s.get("monitor_tts"):
             self.interp.set_monitor_tts(True)
             self.monitor_switch.select()
+        if s.get("consent_chime"):
+            self.interp._consent_chime = True
+            self.consent_switch.select()
         self._change_font(0)  # apply saved caption size to tags
 
     def _bind_shortcuts(self) -> None:
@@ -384,10 +434,19 @@ class ControlBox:
         )
         if getattr(self.interp, "_monitor_tts", False):
             self.monitor_switch.select()
-        self.monitor_switch.grid(row=13, column=0, padx=16, pady=(2, 8), sticky="w")
+        self.monitor_switch.grid(row=13, column=0, padx=16, pady=(2, 2), sticky="w")
+
+        self.consent_switch = ctk.CTkSwitch(
+            sb, text="Say 'call is translated' notice", width=200,
+            progress_color=ACCENT, font=ctk.CTkFont("Segoe UI", 12),
+            command=self._on_consent,
+        )
+        if getattr(self.interp, "_consent_chime", False):
+            self.consent_switch.select()
+        self.consent_switch.grid(row=14, column=0, padx=16, pady=(2, 8), sticky="w")
 
         fs_frame = ctk.CTkFrame(sb, fg_color="transparent")
-        fs_frame.grid(row=14, column=0, padx=16, pady=(0, 16), sticky="ew")
+        fs_frame.grid(row=15, column=0, padx=16, pady=(0, 16), sticky="ew")
         ctk.CTkLabel(
             fs_frame, text="Caption size", anchor="w",
             font=ctk.CTkFont("Segoe UI", 12),
@@ -708,6 +767,11 @@ class ControlBox:
         self._toast("TTS monitor " + ("on — you'll hear the voice" if enabled else "off"))
         self._persist()
 
+    def _on_consent(self) -> None:
+        self.interp._consent_chime = bool(self.consent_switch.get())
+        logger.info("GUI consent notice -> %s", self.interp._consent_chime)
+        self._persist()
+
     def _toast(self, message: str) -> None:
         if not hasattr(self, "_toast_label"):
             self._toast_label = ctk.CTkLabel(
@@ -749,6 +813,7 @@ class ControlBox:
             "timestamps": self._timestamps,
             "auto_detect": not getattr(self.interp, "_force_language", True),
             "monitor_tts": bool(getattr(self.interp, "_monitor_tts", False)),
+            "consent_chime": bool(getattr(self.interp, "_consent_chime", False)),
             "font_size": self._font_size,
         })
         try:
@@ -1068,8 +1133,7 @@ class ControlBox:
         if not force and self._lines_since_autosave < 10:
             return
         try:
-            base = os.environ.get("APPDATA") or str(Path.home())
-            path = Path(base) / APP_NAME / "autosave_transcript.txt"
+            path = app_data_dir() / "autosave_transcript.txt"
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(f"=== autosaved {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
@@ -1147,10 +1211,15 @@ def main(argv=None) -> int:
 
     args = build_arg_parser().parse_args(argv)
     configure_root(level="DEBUG" if args.verbose else "INFO")
-    log_path = attach_session_file(Path(__file__).parent / "logs")
+    if getattr(sys, "frozen", False):
+        log_path = attach_session_file(app_data_dir() / "logs")
+    else:
+        log_path = attach_session_file(Path(__file__).parent / "logs")
     _sweep_stale_temp()
     if log_path:
         logger.info("Session log -> %s", log_path)
+    logger.info("Live Interpreter v%s", APP_VERSION)
+    _check_update_async()
 
     if args.list_mics:
         from audio_capture import list_microphones
@@ -1161,6 +1230,15 @@ def main(argv=None) -> int:
 
     # Saved settings apply unless the user explicitly passed a CLI flag.
     saved = load_settings()
+    # First-run wizard (packaged installs): keys/setup missing → walk through
+    # it before the main window. Devs with a repo .env / existing settings
+    # skip silently.
+    if not saved.get("wizard_done") and not keys_present():
+        logger.info("First run detected — starting setup wizard.")
+        from setup_wizard import run_wizard
+
+        run_wizard()
+        saved = load_settings()
     argv_set = set(argv or [])
     if "--person1-lang" not in argv_set and saved.get("person1_language"):
         args.person1_lang = saved["person1_language"]
@@ -1199,6 +1277,7 @@ def main(argv=None) -> int:
         elevenlabs_stability=args.elevenlabs_stability,
         elevenlabs_similarity=args.elevenlabs_similarity,
         monitor_tts=bool(saved.get("monitor_tts", False)),
+        consent_chime=bool(saved.get("consent_chime", False)),
     )
     # Remember working device names so plain `stream_gui.py` relaunches identically.
     if args.mic_device:

@@ -7,10 +7,19 @@ local ``.env`` file). Nothing sensitive is ever hard-coded.
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+# App data home for frozen builds: %APPDATA%\LiveInterpreter
+APP_DIR_NAME = "LiveInterpreter"
+
+
+def app_data_dir() -> Path:
+    base = os.environ.get("APPDATA") or str(Path.home())
+    return Path(base) / APP_DIR_NAME
 
 # ---------------------------------------------------------------------------
 # Optional .env support
@@ -18,10 +27,20 @@ from typing import Optional
 # python-dotenv is *optional*. If it is installed we load a local .env file so
 # developers can keep secrets out of their shell environment. If it is missing
 # the system still works as long as the variables are exported in the shell.
+#
+# Frozen builds (PyInstaller) can't rely on a .env next to the exe — the
+# user-writable home for keys is %APPDATA%\LiveInterpreter\.env instead.
 try:  # pragma: no cover - environment dependent
+    import os as _os
+    from pathlib import Path as _Path
+
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv()  # developer flow: repo/.env
+    if getattr(sys, "frozen", False):  # installed flow
+        _appdata_env = app_data_dir() / ".env"
+        if _appdata_env.exists():
+            load_dotenv(_appdata_env, override=True)
 except Exception:  # noqa: BLE001 - never fail on a missing optional dep
     pass
 

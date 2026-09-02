@@ -160,6 +160,7 @@ class StreamingInterpreter:
         elevenlabs_similarity: float = 0.4,
         monitor_tts: bool = False,
         monitor_device: Optional[int] = None,
+        consent_chime: bool = False,
     ):
         self.person1_language = Settings.validate_language(person1_language)
         self.user_language = Settings.validate_language(user_language)
@@ -201,6 +202,10 @@ class StreamingInterpreter:
         self._monitor_stream = None
         self._monitor_samplerate = None
         self._monitor_channels = None
+        # Fair-play notice: announce at session start that the call is
+        # auto-translated (toggleable; off = silent).
+        self._consent_chime = consent_chime
+        self._chime_done = False
         # Krisp-style spectral gating on YOUR microphone so Whisper doesn't
         # hallucinate on steady fan/AC background noise.
         self._noise_cancel = noise_cancel
@@ -507,6 +512,16 @@ class StreamingInterpreter:
             t_start = time.time()
             try:
                 self._ensure_tts(lang, samplerate=self._tts_out_samplerate)
+                # One-time consent notice: P1 hears that the call is translated.
+                if self._consent_chime and not self._chime_done:
+                    self._chime_done = True
+                    try:
+                        notice = ("Heads up: this call is auto-translated. "
+                                  "Everything you say is spoken in another language.")
+                        logger.info("Consent notice playing.")
+                        self._speak_utt(player, notice, uid=-1)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Consent notice failed: %s", exc)
                 logger.info(
                     "TTS speaking uid=%d lang=%s engine=%s fmt=%s out=%sHz/%dch",
                     uid, lang, type(self.tts).__name__,
