@@ -49,22 +49,20 @@ HALLUCINATION_PHRASES = {
 # Two-tier hallucination filter (matching is punctuation/case-insensitive —
 # Whisper always writes "Thank you." with the period, which the old exact
 # match never caught).
-# 1) YouTube/music filler nobody says mid-call: dropped unconditionally.
+# YouTube/music filler + the notorious "Thank you." family: dropped
+# UNCONDITIONALLY — they are the #1 Whisper hallucination and the user
+# explicitly wants them never translated or voiced, even when genuinely said.
 _HALLUCINATION_EXACT = {
     "thanks for watching", "thank you for watching", "thanks for the video",
     "please subscribe", "subscribe", "subscribe to the channel",
     "see you in the next video", "see you next time", "see you next video",
     "thank you and bye", "thank you bye", "thanks for watching bye",
     "gracias", "merci", "obrigado", "danke", "arigato",
-}
-# 2) Common REAL speech too: only dropped when the audio was quiet
-#    (hallucinations live on silence/music; a real spoken "thank you" is loud).
-_HALLUCINATION_QUIET = {
+    # the "Thank you." family (main hallucination):
     "thank you", "thanks", "thank you so much", "thank you very much",
-    "thanks so much", "many thanks", "thanks a lot", "thank you bye",
+    "thanks so much", "many thanks", "thanks a lot", "thanks a ton",
+    "thank you so much bye", "thank you thanks",
 }
-# Below this average RMS, a matching phrase is treated as a hallucination.
-QUIET_HALLUCINATION_RMS = 0.05
 
 
 def _normalize_hallucination(text: str) -> str:
@@ -458,15 +456,10 @@ class StreamingInterpreter:
         if not text:
             return count
         # Drop Whisper hallucinations (punctuation-insensitive matching):
-        #  - YouTube/music filler -> always
-        #  - real-speech phrases ("thank you") -> only when audio was quiet
+        # "Thank you."-family + YouTube/music filler -> never translated/voiced.
         norm = _normalize_hallucination(text)
         if norm in _HALLUCINATION_EXACT:
             logger.info("Dropped hallucination: %r", text)
-            return count
-        if norm in _HALLUCINATION_QUIET and self._avg_rms(wav) < QUIET_HALLUCINATION_RMS:
-            logger.info("Dropped quiet hallucination (rms=%.4f): %r",
-                        self._avg_rms(wav), text)
             return count
         if _is_repeat_gibberish(text):
             logger.info("Dropped repetition hallucination: %r", text)

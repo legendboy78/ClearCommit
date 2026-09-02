@@ -41,7 +41,11 @@ SYSTEM_PROMPT = (
     "language. Default to standard polite speech unless casual cues are "
     "present.\n"
     "4. ZERO CONVERSATIONAL FILLER: Do not explain your choices, apologize, or "
-    "provide commentary. Output ONLY the final translated text."
+    "provide commentary. Output ONLY the final translated text.\n"
+    "5. THANKS PHRASES: When the text contains a thanks variant — 'appreciate "
+    "it', 'many thanks', 'thanks a lot', 'much appreciated' — render it as the "
+    "standard natural 'thank you' equivalent in the target language, never as "
+    "a literal translation of the variant."
 )
 
 
