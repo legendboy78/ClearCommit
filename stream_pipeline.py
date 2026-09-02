@@ -58,10 +58,8 @@ _HALLUCINATION_EXACT = {
     "see you in the next video", "see you next time", "see you next video",
     "thank you and bye", "thank you bye", "thanks for watching bye",
     "gracias", "merci", "obrigado", "danke", "arigato",
-    # the "Thank you." family (main hallucination):
-    "thank you", "thanks", "thank you so much", "thank you very much",
-    "thanks so much", "many thanks", "thanks a lot", "thanks a ton",
-    "thank you so much bye", "thank you thanks",
+    # ONLY the bare hallucination words (user request):
+    "thank you", "thanks",
 }
 
 
