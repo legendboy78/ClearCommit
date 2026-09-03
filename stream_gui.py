@@ -147,7 +147,9 @@ def load_settings() -> dict:
     try:
         import json
 
-        with open(_settings_path(), encoding="utf-8") as fh:
+        # utf-8-sig tolerates a BOM (PowerShell's Set-Content -Encoding UTF8
+        # writes one; a stray BOM must not silently nuke all settings).
+        with open(_settings_path(), encoding="utf-8-sig") as fh:
             data = json.load(fh)
         return data if isinstance(data, dict) else {}
     except Exception:  # noqa: BLE001 - missing/corrupt file = defaults
@@ -1196,15 +1198,40 @@ def main(argv=None) -> int:
             pass
 
     if not _acquire_single_instance():
+        # A copy is already running: bring ITS window to the front instead of
+        # nagging (covers the common double-double-click / hotkey spam case),
+        # falling back to a message box when the window can't be found.
         import ctypes
 
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            "Live Interpreter is already running.\n"
-            "Use the existing window (check the taskbar) or close it first.",
-            "Already running",
-            0x30,  # MB_ICONWARNING
-        )
+        user32 = ctypes.windll.user32
+
+        def _find_and_focus(target_title: str) -> bool:
+            found = []
+
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+            def cb(hwnd, _lparam):
+                buf = ctypes.create_unicode_buffer(256)
+                user32.GetWindowTextW(hwnd, buf, 256)
+                if buf.value == target_title:
+                    found.append(hwnd)
+                return True
+
+            user32.EnumWindows(cb, None)
+            if not found:
+                return False
+            hwnd = found[0]
+            user32.ShowWindow(hwnd, 9)   # SW_RESTORE (undo minimize)
+            user32.SetForegroundWindow(hwnd)
+            return True
+
+        if not _find_and_focus("Live Interpreter"):
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "Live Interpreter is already running.\n"
+                "Use the existing window (check the taskbar) or close it first.",
+                "Already running",
+                0x30,  # MB_ICONWARNING
+            )
         return 0
 
     _disable_console_quickedit()
@@ -1247,6 +1274,17 @@ def main(argv=None) -> int:
         args.mic_device = saved["mic_device"]
     if "--tts-output-device" not in argv_set and saved.get("tts_output_device"):
         args.tts_output_device = saved["tts_output_device"]
+    elif "--tts-output-device" not in argv_set and not saved.get("tts_output_device"):
+        # No saved device (never set up): default to the virtual cable so the
+        # translated voice reaches Discord instead of the system speakers.
+        try:
+            from audio_capture import resolve_device
+
+            resolve_device("CABLE Input", "output")
+            args.tts_output_device = "CABLE Input"
+            logger.info("No TTS device saved — defaulting to VB-Cable 'CABLE Input'.")
+        except Exception:  # noqa: BLE001 - no cable installed; leave default
+            pass
     if "--silence-timeout" not in argv_set and saved.get("silence_timeout"):
         args.silence_timeout = float(saved["silence_timeout"])
 
@@ -1279,11 +1317,16 @@ def main(argv=None) -> int:
         monitor_tts=bool(saved.get("monitor_tts", False)),
         consent_chime=bool(saved.get("consent_chime", False)),
     )
-    # Remember working device names so plain `stream_gui.py` relaunches identically.
+    # Remember working device names so plain relaunches are identical. Even
+    # when no flag was passed, save what actually got used (e.g. the VB-Cable
+    # default) so the next launch resolves to the exact same device.
     if args.mic_device:
         saved["mic_device"] = str(args.mic_device)
     if args.tts_output_device:
         saved["tts_output_device"] = str(args.tts_output_device)
+    elif interp.tts_output_device is not None:
+        # The interpreter auto-defaulted to the virtual cable — remember it.
+        saved["tts_output_device"] = "CABLE Input"
     saved["person1_language"] = interp.person1_language
     save_settings(saved)
 

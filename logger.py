@@ -75,6 +75,12 @@ def attach_session_file(log_dir: str | Path, keep: int = 10) -> Optional[Path]:
         root.addHandler(handler)
         if root.level > logging.INFO or root.level == 0:
             root.setLevel(logging.INFO)
+        # Named app loggers (stream_gui, stream_pipeline, ...) set
+        # propagate=False in get_logger(), so records would never reach the
+        # root handler — attach the file handler to them directly too.
+        for lg in list(logging.Logger.manager.loggerDict.values()):
+            if isinstance(lg, logging.Logger) and not lg.propagate:
+                lg.addHandler(handler)
         _SESSION_HANDLERS.append(handler)
         return path
     except Exception:  # noqa: BLE001 - logging must never crash the app
