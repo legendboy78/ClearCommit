@@ -59,7 +59,7 @@ _HALLUCINATION_EXACT = {
     "thank you and bye", "thank you bye", "thanks for watching bye",
     "gracias", "merci", "obrigado", "danke", "arigato",
     # ONLY the bare hallucination words (user request):
-    "thank you", "thanks",
+    "thank you", "thanks", "bye",
 }
 
 
