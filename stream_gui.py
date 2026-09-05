@@ -228,6 +228,8 @@ class ControlBox:
         self._tick_count = 0
         self._last_chip_text = ""
         self._iconified = False
+        self._voices: list[dict] = []
+        self._voice_ids: dict[str, str] = {}
         self._schedule_tick()
         self._restore_settings()
         self._bind_shortcuts()
@@ -294,6 +296,8 @@ class ControlBox:
         if s.get("consent_chime"):
             self.interp._consent_chime = True
             self.consent_switch.select()
+        if s.get("voice_id"):
+            self.interp.set_voice(s["voice_id"])
         self._change_font(0)  # apply saved caption size to tags
 
     def _bind_shortcuts(self) -> None:
@@ -350,7 +354,18 @@ class ControlBox:
         self.lang_menu.set(self._current_label())
         self.lang_menu.grid(row=1, column=0, padx=16, sticky="ew")
 
-        section("TRANSLATE MODEL", 2)
+        section("TRANSLATED VOICE", 2)
+        self.voice_menu = ctk.CTkOptionMenu(
+            sb, values=["loading voices…"], width=200,
+            fg_color="#232830", button_color=ACCENT, button_hover_color="#3a76d8",
+            font=ctk.CTkFont("Segoe UI", 12),
+            command=self._on_voice,
+        )
+        self.voice_menu.set("loading voices…")
+        self.voice_menu.grid(row=3, column=0, padx=16, sticky="ew")
+        self.root.after(400, self._load_voices)
+
+        section("TRANSLATE MODEL", 4)
         self.model_seg = ctk.CTkSegmentedButton(
             sb, values=["Accurate", "Fast"], width=200,
             selected_color=ACCENT, selected_hover_color="#3a76d8",
@@ -358,9 +373,9 @@ class ControlBox:
             command=self._on_model,
         )
         self.model_seg.set(self._current_model_label())
-        self.model_seg.grid(row=3, column=0, padx=16, sticky="ew")
+        self.model_seg.grid(row=5, column=0, padx=16, sticky="ew")
 
-        section("YOUR SPEECH RECOGNITION", 4)
+        section("YOUR SPEECH RECOGNITION", 6)
         self.stt_seg = ctk.CTkSegmentedButton(
             sb, values=["Accurate", "Turbo"], width=200,
             selected_color=ACCENT, selected_hover_color="#3a76d8",
@@ -368,19 +383,19 @@ class ControlBox:
             command=self._on_stt,
         )
         self.stt_seg.set("Accurate")
-        self.stt_seg.grid(row=5, column=0, padx=16, sticky="ew")
+        self.stt_seg.grid(row=7, column=0, padx=16, sticky="ew")
 
-        section("RUNTIME KNOBS", 6)
+        section("RUNTIME KNOBS", 8)
         self.noise_switch = ctk.CTkSwitch(
             sb, text="Noise cancel (experimental)", width=200,
             progress_color=ACCENT, font=ctk.CTkFont("Segoe UI", 12),
             command=self._on_noise,
         )
         self.noise_switch.deselect()
-        self.noise_switch.grid(row=7, column=0, padx=16, pady=(0, 2), sticky="w")
+        self.noise_switch.grid(row=9, column=0, padx=16, pady=(0, 2), sticky="w")
 
         sil_frame = ctk.CTkFrame(sb, fg_color="transparent")
-        sil_frame.grid(row=8, column=0, padx=16, sticky="ew")
+        sil_frame.grid(row=10, column=0, padx=16, sticky="ew")
         self.sil_val = ctk.CTkLabel(
             sil_frame, text=f"{self.interp._silence_timeout:.2f} s",
             font=ctk.CTkFont("Segoe UI", 12), text_color="#9ca3af", width=48,
@@ -396,21 +411,21 @@ class ControlBox:
             command=self._on_silence,
         )
         self.sil_slider.set(self.interp._silence_timeout)
-        self.sil_slider.grid(row=9, column=0, padx=16, sticky="ew")
+        self.sil_slider.grid(row=11, column=0, padx=16, sticky="ew")
 
         self.top_switch = ctk.CTkSwitch(
             sb, text="Always on top", width=200,
             progress_color=ACCENT, font=ctk.CTkFont("Segoe UI", 12),
             command=self._on_topmost,
         )
-        self.top_switch.grid(row=10, column=0, padx=16, pady=(6, 2), sticky="w")
+        self.top_switch.grid(row=12, column=0, padx=16, pady=(6, 2), sticky="w")
 
         self.ts_switch = ctk.CTkSwitch(
             sb, text="Timestamps", width=200,
             progress_color=ACCENT, font=ctk.CTkFont("Segoe UI", 12),
             command=self._on_timestamps,
         )
-        self.ts_switch.grid(row=11, column=0, padx=16, pady=(2, 2), sticky="w")
+        self.ts_switch.grid(row=13, column=0, padx=16, pady=(2, 2), sticky="w")
         if self._timestamps:
             self.ts_switch.select()
 
@@ -425,7 +440,7 @@ class ControlBox:
         )
         if not getattr(self.interp, "_force_language", True):
             self.detect_switch.select()
-        self.detect_switch.grid(row=12, column=0, padx=16, pady=(2, 2), sticky="w")
+        self.detect_switch.grid(row=14, column=0, padx=16, pady=(2, 2), sticky="w")
 
         # Hear the translated TTS on your own speakers/headphones (like
         # Windows "Listen to this device", but only while this is on).
@@ -436,7 +451,7 @@ class ControlBox:
         )
         if getattr(self.interp, "_monitor_tts", False):
             self.monitor_switch.select()
-        self.monitor_switch.grid(row=13, column=0, padx=16, pady=(2, 2), sticky="w")
+        self.monitor_switch.grid(row=15, column=0, padx=16, pady=(2, 2), sticky="w")
 
         self.consent_switch = ctk.CTkSwitch(
             sb, text="Say 'call is translated' notice", width=200,
@@ -445,10 +460,10 @@ class ControlBox:
         )
         if getattr(self.interp, "_consent_chime", False):
             self.consent_switch.select()
-        self.consent_switch.grid(row=14, column=0, padx=16, pady=(2, 8), sticky="w")
+        self.consent_switch.grid(row=16, column=0, padx=16, pady=(2, 8), sticky="w")
 
         fs_frame = ctk.CTkFrame(sb, fg_color="transparent")
-        fs_frame.grid(row=15, column=0, padx=16, pady=(0, 16), sticky="ew")
+        fs_frame.grid(row=17, column=0, padx=16, pady=(0, 16), sticky="ew")
         ctk.CTkLabel(
             fs_frame, text="Caption size", anchor="w",
             font=ctk.CTkFont("Segoe UI", 12),
@@ -763,6 +778,39 @@ class ControlBox:
                     "auto-detect" if auto else "locked to dropdown")
         self._persist()
 
+    def _load_voices(self) -> None:
+        """Fill the voice dropdown from the ElevenLabs account (background)."""
+        def work():
+            voices = self.interp.list_voices()
+            self._ui_call(lambda: self._populate_voices(voices))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _populate_voices(self, voices: list[dict]) -> None:
+        self._voices = voices
+        if not voices:
+            self.voice_menu.configure(values=["(no voices found)"])
+            self.voice_menu.set("(no voices found)")
+            return
+        current = getattr(self.interp, "_voice_id", "") or ""
+        labels = []
+        for v in voices:
+            short = v["id"][:6]
+            labels.append(f"{v['name']} ({short})")
+            self._voice_ids[f"{v['name']} ({short})"] = v["id"]
+        self.voice_menu.configure(values=labels)
+        current_label = next((lb for lb, vid in self._voice_ids.items()
+                              if vid == current), labels[0])
+        self.voice_menu.set(current_label)
+
+    def _on_voice(self, label: str) -> None:
+        vid = self._voice_ids.get(label)
+        if not vid:
+            return
+        self.interp.set_voice(vid)
+        self._toast(f"Voice -> {label.split(' (')[0]}")
+        self._persist()
+
     def _on_monitor(self) -> None:
         enabled = bool(self.monitor_switch.get())
         self.interp.set_monitor_tts(enabled)
@@ -816,6 +864,7 @@ class ControlBox:
             "auto_detect": not getattr(self.interp, "_force_language", True),
             "monitor_tts": bool(getattr(self.interp, "_monitor_tts", False)),
             "consent_chime": bool(getattr(self.interp, "_consent_chime", False)),
+            "voice_id": getattr(self.interp, "_voice_id", None),
             "font_size": self._font_size,
         })
         try:

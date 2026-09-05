@@ -302,6 +302,40 @@ class StreamingInterpreter:
         target.model = model
         logger.info("STT model (%s) -> %s", side, model)
 
+    def set_voice(self, voice_id: str) -> None:
+        """Hot-swap the ElevenLabs voice (applies on the next TTS job)."""
+        if not voice_id or voice_id == self._voice_id:
+            return
+        self._voice_id = voice_id
+        # Force an engine rebuild so the next job uses the new voice.
+        self._tts_lang = None
+        logger.info("TTS voice -> %s (next utterance)", voice_id)
+
+    def list_voices(self) -> list[dict]:
+        """Account voices for the GUI picker: [{id, name, desc}]."""
+        import requests as _rq
+
+        try:
+            resp = _rq.get(
+                "https://api.elevenlabs.io/v1/voices",
+                headers={"xi-api-key": self._eleven_key},
+                timeout=15,
+            )
+            out = []
+            for v in resp.json().get("voices", []):
+                labels = v.get("labels", {}) or {}
+                bits = [labels.get(k) for k in
+                        ("gender", "descriptive", "age", "accent") if labels.get(k)]
+                out.append({
+                    "id": v["voice_id"],
+                    "name": v["name"],
+                    "desc": " · ".join(bits),
+                })
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not list voices: %s", exc)
+            return []
+
     def stop(self) -> None:
         """Signal the running loop(s) to finish and release audio devices."""
         self._stop_ev.set()
