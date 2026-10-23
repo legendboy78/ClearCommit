@@ -28,8 +28,12 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        "tkinter.test", "gradio", "discord", "matplotlib", "numpy.tests",
-        "pytest", "setuptools", "pip", "wheel",
+        # Dead weight for this app: big libs whose analysis/copy dominates
+        # build time. Re-add only if a future dependency actually needs them.
+        "psutil", "IPython", "jedi", "pandas", "PyQt5", "PySide2", "PyQt6",
+        "PySide6", "torch", "tensorflow", "scipy", "matplotlib",
+        "gradio", "discord", "numpy.tests", "pytest", "setuptools", "pip",
+        "wheel", "tkinter.test",
     ],
     noarchive=False,
 )

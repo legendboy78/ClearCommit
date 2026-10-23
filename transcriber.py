@@ -107,3 +107,95 @@ class Transcriber:
             detected, duration or 0.0, text[:80] + ("..." if len(text) > 80 else ""),
         )
         return TranscriptionResult(text=text, language=detected, duration=duration)
+
+
+class DeepgramTranscriber:
+    """Speech-to-text via Deepgram Nova-3 (pre-recorded API).
+
+    Drop-in replacement for :class:`Transcriber` — same ``transcribe()``
+    interface returning the same :class:`TranscriptionResult`.
+
+    Nova-3 advantages over Whisper:
+        * Native multi-language detection (no need to lock to one language)
+        * Better handling of code-switching (mixed languages in one utterance)
+        * Smart formatting (punctuation, numbers)
+
+    Requires ``DEEPGRAM_API_KEY`` (same key used for Deepgram Aura TTS).
+    """
+
+    def __init__(self, api_key: Optional[str] = None,
+                 model: str = "nova-3"):
+        self._api_key = api_key or os.environ.get("DEEPGRAM_API_KEY", "")
+        if not self._api_key:
+            raise RuntimeError("DEEPGRAM_API_KEY is not set.")
+        self.model = model
+
+    def transcribe(self, audio_path: str | Path,
+                   language: Optional[str] = None) -> TranscriptionResult:
+        """Transcribe ``audio_path`` using Deepgram Nova-3.
+
+        ``language`` is accepted for interface compatibility but Nova-3
+        handles multi-language detection natively, so it is passed as a
+        hint rather than a hard lock.
+        """
+        audio_path = Path(audio_path)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        # Deepgram language param: ISO code, "multi" for auto-detect
+        dg_lang = language if language else "multi"
+
+        url = "https://api.deepgram.com/v1/listen"
+        params = {
+            "model": self.model,
+            "language": dg_lang,
+            "smart_format": "true",
+            "punctuate": "true",
+        }
+        headers = {
+            "Authorization": f"Token {self._api_key}",
+            "Content-Type": "audio/wav",
+        }
+
+        logger.info("Transcribing %s with Deepgram %s (lang=%s)...",
+                    audio_path.name, self.model, dg_lang)
+        try:
+            with open(audio_path, "rb") as fh:
+                resp = requests.post(
+                    url, params=params, headers=headers, data=fh, timeout=30,
+                )
+        except requests.exceptions.RequestException as exc:
+            logger.error("Deepgram transcription failed: %s", exc)
+            raise RuntimeError(f"Deepgram transcription failed: {exc}") from exc
+
+        if resp.status_code == 401:
+            raise RuntimeError("Deepgram transcription failed: invalid API key")
+        if resp.status_code == 429:
+            raise RuntimeError("Deepgram transcription failed: rate limited")
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Deepgram transcription failed ({resp.status_code})")
+
+        data = resp.json()
+        try:
+            alt = data["results"]["channels"][0]["alternatives"][0]
+            text = (alt.get("transcript") or "").strip()
+            confidence = alt.get("confidence", 0.0)
+        except (KeyError, IndexError):
+            text = ""
+            confidence = 0.0
+
+        detected = (data.get("metadata", {}).get("language")
+                    or language or "unknown")
+
+        if not text:
+            raise RuntimeError(
+                "Transcription returned empty text. The audio may be silent, "
+                "too noisy, or in an unsupported language."
+            )
+
+        logger.info(
+            "Transcribed (%s, conf=%.2f): %s",
+            detected, confidence, text[:80] + ("..." if len(text) > 80 else ""),
+        )
+        return TranscriptionResult(text=text, language=detected)

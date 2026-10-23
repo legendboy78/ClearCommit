@@ -9,6 +9,13 @@ __pycache__/
 temp/
 output/
 
+# Build and test artifacts
+dist/
+build/
+debug.log
+.pytest_cache/
+lab_samples/
+
 # Pre-change snapshots
 backup_*/
 

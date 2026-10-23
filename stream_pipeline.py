@@ -28,7 +28,7 @@ import time
 import wave
 from collections import deque
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -36,10 +36,10 @@ import numpy as np
 # Captures whose *average* RMS energy is below this are treated as silence or
 # background noise and dropped before they reach Whisper (which otherwise
 # fabricates "Thank you" / "Grazie" style hallucinations on quiet audio).
-MIN_SPEECH_RMS = 0.02
-# Voice-activity threshold used to start an utterance (slightly higher than the
-# MicCapture default to ignore low-level ambient noise).
-VAD_THRESHOLD = 0.02
+MIN_SPEECH_RMS = 0.008
+# Voice-activity threshold used to start an utterance (lower = more sensitive
+# to distant/quiet speech; raise if background noise triggers false captures).
+VAD_THRESHOLD = 0.008
 # Whisper's classic low-energy hallucinations. Dropped before display/translate
 # so they don't loop or pollute captions.
 HALLUCINATION_PHRASES = {
@@ -59,7 +59,7 @@ _HALLUCINATION_EXACT = {
     "thank you and bye", "thank you bye", "thanks for watching bye",
     "gracias", "merci", "obrigado", "danke", "arigato",
     # ONLY the bare hallucination words (user request):
-    "thank you", "thanks", "bye",
+    "thank you", "thanks", "bye", "bye bye",
 }
 
 
@@ -71,6 +71,12 @@ def _normalize_hallucination(text: str) -> str:
 # After TTS finishes, ignore captures for this long. Covers the acoustic echo
 # latency of speaker -> mic feedback (real fix: route TTS to a virtual mic).
 POST_TTS_COOLDOWN = 2.0  # echo guard; covers Discord round-trip latency too
+# Your own TTS can physically leak into your microphone (speakers open,
+# "Hear TTS locally" on, or a headset bleeding sound). Whisper then
+# transcribes the PC's voice as YOURS — short hallucinated utterances like
+# "you"/"Lei". Gating the mic during playback plus a short cooldown removes
+# that echo while keeping post-TTS barge-in delay minimal.
+MIC_ECHO_COOLDOWN = 1.0  # only used when mic_echo_guard is ON
 # TTS jobs older than this (utterance accepted -> dequeue) are dropped instead
 # of spoken — stale speech after a provider stall confuses everyone.
 MAX_TTS_QUEUE_AGE = 10.0
@@ -161,6 +167,8 @@ class StreamingInterpreter:
         monitor_tts: bool = False,
         monitor_device: Optional[int] = None,
         consent_chime: bool = False,
+        on_final_utterance: Optional[Callable] = None,
+        mic_echo_guard: bool = False,
     ):
         self.person1_language = Settings.validate_language(person1_language)
         self.user_language = Settings.validate_language(user_language)
@@ -206,6 +214,14 @@ class StreamingInterpreter:
         # auto-translated (toggleable; off = silent).
         self._consent_chime = consent_chime
         self._chime_done = False
+        self._on_final_utterance = on_final_utterance
+        # Drop mic captures while our own TTS is playing (speaker leakage
+        # made Whisper transcribe the PC's voice as the user's).
+        self._mic_echo_guard = bool(mic_echo_guard)
+        # Per-service health reporting + language mismatch callback (wired
+        # to the ClearCommit integration when connected; no-ops otherwise).
+        self._service_health_cb = None
+        self._lang_mismatch_cb = None
         # Krisp-style spectral gating on YOUR microphone so Whisper doesn't
         # hallucinate on steady fan/AC background noise.
         self._noise_cancel = noise_cancel
@@ -225,12 +241,21 @@ class StreamingInterpreter:
         # Both sides default to whisper-large-v3 (accuracy). Turbo (fast but
         # noticeably less accurate) remains selectable via the GUI dropdown /
         # set_stt_model(). Keys rotate across all Groq keys.
-        self.transcriber_p1 = Transcriber(
-            api_keys=self._groq_keys, model=GROQ_TRANSCRIBE_MODEL
-        )
-        self.transcriber_user = Transcriber(
-            api_keys=self._groq_keys, model=GROQ_TRANSCRIBE_MODEL
-        )
+        # STT backend is configurable: "groq" (Whisper) or "deepgram" (Nova-3).
+        self._stt_backend = os.environ.get("STT_BACKEND", "groq").lower()
+        if self._stt_backend == "deepgram":
+            from transcriber import DeepgramTranscriber
+            self.transcriber_p1 = DeepgramTranscriber()
+            self.transcriber_user = DeepgramTranscriber()
+            logger.info("STT backend: Deepgram Nova-3 (multi-language)")
+        else:
+            self.transcriber_p1 = Transcriber(
+                api_keys=self._groq_keys, model=GROQ_TRANSCRIBE_MODEL
+            )
+            self.transcriber_user = Transcriber(
+                api_keys=self._groq_keys, model=GROQ_TRANSCRIBE_MODEL
+            )
+            logger.info("STT backend: Groq Whisper large-v3")
         # Backward-compatible alias (legacy callers use ``self.transcriber``).
         self.transcriber = self.transcriber_p1
         self.translator = self._build_translator()
@@ -246,6 +271,12 @@ class StreamingInterpreter:
         # Live control hooks (used by the GUI / Stop button).
         self._stop_ev = threading.Event()
         self._captures: list[MicCapture] = []
+        # Per-side utterance workers: capture threads only enqueue finalized
+        # utterances; STT + translation run here so a slow provider call never
+        # delays detection of the next utterance (per-side FIFO keeps order).
+        self._work_qs: "dict[str, queue.Queue]" = {}
+        self._translate_qs: dict = {"p1": queue.Queue(), "you": queue.Queue()}
+        self._side_stop: "dict[str, threading.Event]" = {}
 
         # Echo guard: ignore input while TTS is playing (prevents the speaker's
         # own output from being re-transcribed into garbage), plus a cooldown
@@ -413,16 +444,16 @@ class StreamingInterpreter:
         path.write_bytes(wav_bytes)
         transcriber = self.transcriber_user if speak else self.transcriber_p1
         try:
-            delay = 0.8
+            delay = 0.3
             last_exc: Optional[Exception] = None
-            for attempt in range(1, 4):
+            for attempt in range(1, 3):
                 try:
                     return transcriber.transcribe(path, language=language)
                 except Exception as exc:  # noqa: BLE001
                     if "empty text" in str(exc).lower():
                         raise  # silent/noisy audio — retrying cannot help
                     last_exc = exc
-                    if attempt < 3:
+                    if attempt < 2:
                         logger.warning(
                             "STT attempt %d failed (%s); retrying in %.1fs",
                             attempt, exc, delay,
@@ -474,14 +505,12 @@ class StreamingInterpreter:
     def _process_utterance(
         self, wav, *, source, target, speak, max_utterances, count
     ) -> int:
-        """Process one captured utterance. Returns the updated count.
+        """STT only - emits the original caption immediately and hands off
+        to the translation pipeline. Returns the updated count.
 
-        STT + translation run here; in the speak path the translated text is
-        enqueued to the TTS worker so this thread returns immediately and keeps
-        capturing (parallel pipeline — no dead window while TTS plays).
+        STT and translation run on SEPARATE pipeline stages so a slow
+        translation never delays the next utterance's recognition.
         """
-        # STT: lock to the configured source language, or let Whisper detect
-        # (Telugu, etc.) and use what it heard for the translation prompt.
         stt_lang = source if self._force_language else None
         result = self._transcribe(wav, speak=speak, language=stt_lang)
         text = (result.text or "").strip()
@@ -492,8 +521,6 @@ class StreamingInterpreter:
                 source = detected
         if not text:
             return count
-        # Drop Whisper hallucinations (punctuation-insensitive matching):
-        # "Thank you."-family + YouTube/music filler -> never translated/voiced.
         norm = _normalize_hallucination(text)
         if norm in _HALLUCINATION_EXACT:
             logger.info("Dropped hallucination: %r", text)
@@ -505,25 +532,97 @@ class StreamingInterpreter:
         uid = next(self._uid_counter)
         self._uid_t0[uid] = time.time()
         side = "you" if speak else "p1"
-        print(f"🗣️  [{source}] {text}")
+        print(f"\U0001f5e3  [{source}] {text}")
         logger.info("UID %d [%s] %r -> translate to %s", uid, side, text, target)
         self._caption_q.put(("orig", side, source, text, uid))
-        translated_text = self._translate_with_retry(
-            text, target=target, source=source
-        )
-        if speak:
-            # TTS runs on the worker thread; enqueue and move on.
-            if translated_text:
-                logger.info("TTS job queued uid=%d chars=%d", uid, len(translated_text))
-                self._tts_job_q.put((side, target, translated_text, uid))
-            else:
-                self._caption_q.put(("trans", side, target, translated_text, uid))
-        else:
-            print(f"🌐  [{target}] {translated_text}\n")
-            self._caption_q.put(("trans", side, target, translated_text, uid))
+
+        # Language mismatch detection (additive, never changes behaviour).
+        if self._on_final_utterance is not None:
+            try:
+                detected_code = language_name_to_code(getattr(result, "language", None))
+                if detected_code and detected_code != source:
+                    hint = self._lang_mismatch_cb(
+                        uid, detected_code, source) if self._lang_mismatch_cb else None
+                    if hint:
+                        self._caption_q.put(
+                            ("error", side, target, hint[:160], 0))
+            except Exception:
+                pass
+
+        self._report_service_health("stt", True)
+
+        # Hand off to the translation stage (non-blocking for STT worker).
+        self._translate_qs[side].put((uid, text, source, target, speak))
         return count
 
-    # ------------------------------------------------------------------ #
+    def _start_translate_loops(self) -> list:
+        """Per-side translation workers (parallel across sides).
+
+        Each side gets its own FIFO translation worker, so P1 and You
+        translate independently. TTS remains FIFO via _tts_job_q.
+        """
+        threads = []
+        for side in ("p1", "you"):
+            q = queue.Queue()
+            self._translate_qs[side] = q
+
+            def make_worker(sid, tq):
+                def worker() -> None:
+                    while True:
+                        try:
+                            item = tq.get(timeout=0.2)
+                        except queue.Empty:
+                            if self._stop_ev.is_set():
+                                return
+                            continue
+                        if item is None or self._stop_ev.is_set():
+                            return
+                        uid, text, source, target, speak = item
+                        try:
+                            translated = self._translate_with_retry(
+                                text, target=target, source=source
+                            )
+                            self._report_service_health("translate", True)
+                        except Exception as exc:
+                            logger.error("Translation failed uid=%d: %s", uid, exc)
+                            self._caption_q.put(
+                                ("error", sid, target,
+                                 "Translation failed: " + str(exc)[:160], 0))
+                            self._report_service_health("translate", False)
+                            self._tts_lang = None
+                            continue
+                        if speak:
+                            if translated:
+                                self._tts_job_q.put(
+                                    (sid, target, translated, uid))
+                            else:
+                                self._caption_q.put(
+                                    ("trans", sid, target, translated, uid))
+                        else:
+                            self._caption_q.put(
+                                ("trans", sid, target, translated, uid))
+                        if self._on_final_utterance is not None:
+                            try:
+                                self._on_final_utterance(
+                                    side=sid,
+                                    source_lang=source,
+                                    target_lang=target,
+                                    original_text=text,
+                                    translated_text=translated,
+                                    uid=uid,
+                                    accept_ts=self._uid_t0.get(uid),
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "ClearCommit on_final_utterance failed")
+                return worker
+
+            t = threading.Thread(target=make_worker(side, q),
+                                 daemon=True, name=f"translate-{side}")
+            t.start()
+            threads.append(t)
+        return threads
+
     def _tts_worker_loop(self, player) -> None:
         """Speak enqueued (side, lang, text) jobs FIFO on the output stream."""
         while True:
@@ -645,9 +744,46 @@ class StreamingInterpreter:
         return out or [text]
 
     # ------------------------------------------------------------------ #
+    def _report_service_health(self, service: str, ok: bool) -> None:
+        """Report a per-service call outcome to the integration callback."""
+        if self._service_health_cb is not None:
+            try:
+                self._service_health_cb(service, ok)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _should_drop_for_echo(role: Optional[str], tts_active: bool,
+                              last_tts_end: float, now: float,
+                              mic_echo_guard: bool = False) -> bool:
+        """Echo-guard decision (pure; unit-testable).
+
+        * Person 1 (loopback) always drops while TTS plays and for
+          ``POST_TTS_COOLDOWN`` after — the loopback hears the translated
+          voice through the call.
+        * Your mic is NEVER blocked by default. The hallucination filter
+          already catches TTS artifacts. Enable mic_echo_guard ONLY if you
+          have speaker leakage and want to drop TTS echoes at the cost of
+          not being able to talk while TTS plays.
+        """
+        if role == "p1":
+            return tts_active or (now - last_tts_end) < POST_TTS_COOLDOWN
+        if role == "user" and mic_echo_guard:
+            return tts_active or (now - last_tts_end) < MIC_ECHO_COOLDOWN
+        return False
+
     def _capture_loop(self, capture, *, source, target, speak, max_utterances,
                       role: Optional[str] = None):
-        """Run one source's capture+process loop until stopped.
+        """Run one source's CAPTURE loop until stopped.
+
+        Smoothing architecture: this thread only does time-sensitive work —
+        echo guard, silence drop, live-language resolution — and then enqueues
+        the finalized utterance WAV onto this side's work queue. Transcription
+        + translation run on a dedicated per-side worker thread
+        (``_work_loop``), so a slow Whisper call never delays the next
+        utterance's detection or the other side's processing. Per-side FIFO
+        workers preserve caption and TTS ordering within each side.
 
         In two-way mode ``role`` is ``"p1"`` or ``"user"`` and the source/target
         languages are re-read from the live ``self.person1_language`` on every
@@ -660,17 +796,21 @@ class StreamingInterpreter:
         thread never drops — TTS goes to CABLE Input, which cannot echo back
         into your headset mic, so your speech is always transcribed and queued.
         """
-        count = 0
+        side = role or ("user" if speak else "p1")
         try:
             capture.role = role or ("user" if speak else "p1")
             capture.start()
             logger.info("Capture started: source=%s device=%s speak=%s", source, capture.device, speak)
             self._captures.append(capture)
             for wav in capture.utterances():
-                if self._stop_ev.is_set():
+                if self._stop_ev.is_set() or self._side_stop[side].is_set():
                     break
-                # Echo guard (Person 1 loopback only).
-                if role == "p1" and (self._tts_active or (time.time() - self._last_tts_end) < POST_TTS_COOLDOWN):
+                # Echo guard (P1 loopback always; your mic when enabled) —
+                # drops captures of our own TTS voice leaking into inputs.
+                if self._should_drop_for_echo(
+                    role, self._tts_active, self._last_tts_end, time.time(),
+                    self._mic_echo_guard,
+                ):
                     continue
                 # Live language: follow the current Person 1 language mid-call.
                 if role == "user":
@@ -682,28 +822,66 @@ class StreamingInterpreter:
                 if rms < MIN_SPEECH_RMS:
                     logger.debug("Dropped low-energy capture (rms=%.4f) — silence/noise", rms)
                     continue
-                try:
-                    count = self._process_utterance(
-                        wav, source=source, target=target, speak=speak,
-                        max_utterances=max_utterances, count=count,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    # A single failed utterance must not kill the live session.
-                    logger.error("Utterance failed, skipping: %s", exc)
-                    self._caption_q.put(
-                        ("error", "you" if speak else "p1", target,
-                         f"Utterance failed: {exc}"[:160], 0)
-                    )
-                    self._tts_lang = None  # force TTS rebuild on next use
-                if max_utterances and count >= max_utterances:
-                    break
+                # Hand off to the per-side worker; the capture loop returns to
+                # listening immediately (speech is never dropped — the queue
+                # is unbounded and humanly bounded by speaking rate).
+                self._work_qs[side].put((wav, source, target, speak))
         finally:
             try:
                 capture.stop()
             except Exception:  # noqa: BLE001
                 pass
 
+    def _start_work_loop(self, side: str, max_utterances: Optional[int],
+                         num_workers: int = 1) -> list:
+        """Start STT workers for this side.
+
+        Multiple STT workers pull from the same queue, so a slow Whisper
+        call for one utterance doesn't delay the next one. Captions are
+        ordered by uid (monotonic counter), not by processing order.
+        """
+        q = queue.Queue()
+        self._work_qs[side] = q
+        self._side_stop[side] = threading.Event()
+
+        def worker() -> None:
+            count = 0
+            while True:
+                try:
+                    item = q.get(timeout=0.2)
+                except queue.Empty:
+                    if self._stop_ev.is_set() or self._side_stop[side].is_set():
+                        return
+                    continue
+                if item is None or self._stop_ev.is_set() or self._side_stop[side].is_set():
+                    return
+                wav, source, target, speak = item
+                try:
+                    count = self._process_utterance(
+                        wav, source=source, target=target, speak=speak,
+                        max_utterances=max_utterances, count=count,
+                    )
+                except Exception as exc:
+                    logger.error("Utterance failed, skipping: %s", exc)
+                    self._caption_q.put(
+                        ("error", "you" if speak else "p1", target,
+                         f"Utterance failed: {exc}"[:160], 0))
+                    self._report_service_health("translate", False)
+                    self._tts_lang = None
+                if max_utterances and count >= max_utterances:
+                    self._side_stop[side].set()
+                    return
+
+        threads = []
+        for i in range(num_workers):
+            t = threading.Thread(target=worker, daemon=True,
+                                 name=f"stt-worker-{side}-{i}")
+            t.start()
+            threads.append(t)
+        return threads
+
     # ------------------------------------------------------------------ #
+
     def run(self, direction: Optional[str] = None, max_utterances: Optional[int] = None) -> None:
         # Explicit --direction => legacy single-mic mode. Otherwise, two-way
         # when loopback (system audio) or a Person 1 recording device is set.
@@ -996,14 +1174,28 @@ class StreamingInterpreter:
         self._tts_worker = threads[-1]
         for t in threads:
             t.start()
+        # Per-side utterance workers (2 STT workers per side = 4 total).
+        work_threads = [
+            *self._start_work_loop("p1", max_utterances),
+            *self._start_work_loop("user", max_utterances),
+        ]
+        translate_threads = self._start_translate_loops()
         try:
             for t in threads:
                 t.join()
         except KeyboardInterrupt:
             print("\n⏹  Stopped.")
         finally:
+            self._work_qs.get("p1", queue.Queue()).put(None)
+            self._work_qs.get("user", queue.Queue()).put(None)
+            for tq in self._translate_qs.values():
+                tq.put(None)
             self._tts_job_q.put(None)  # wake the TTS worker
             self.stop()
+            for wt in work_threads:
+                wt.join(timeout=2)
+            for tt in translate_threads:
+                tt.join(timeout=2)
             if self._tts_worker is not None:
                 self._tts_worker.join(timeout=2)
             if player is not None:
@@ -1038,6 +1230,9 @@ class StreamingInterpreter:
             noise_cancel=self._noise_cancel,
             silence_timeout=self._silence_timeout,
         )
+        side = "user" if speak else "p1"
+        work_threads = self._start_work_loop(side, max_utterances)
+        translate_threads = self._start_translate_loops()
         worker = None
         if speak:
             worker = threading.Thread(
@@ -1054,7 +1249,14 @@ class StreamingInterpreter:
                 max_utterances=max_utterances,
             )
         finally:
+            self._work_qs.get(side, queue.Queue()).put(None)
+            for tq in self._translate_qs.values():
+                tq.put(None)
             self._tts_job_q.put(None)  # wake the TTS worker
+            for wt in work_threads:
+                wt.join(timeout=2)
+            for tt in translate_threads:
+                tt.join(timeout=2)
             if worker is not None:
                 worker.join(timeout=2)
             if player is not None:
