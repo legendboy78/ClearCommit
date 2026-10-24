@@ -1179,6 +1179,22 @@ class ControlBox:
             self.provider_url_entry.configure(state="disabled")
         mwidget(self.provider_url_entry)
 
+        # API key entry: per-preset, masked. Stored in the app settings file;
+        # an empty field falls back to the preset's env var (.env).
+        self.provider_key_entry = ctk.CTkEntry(
+            self.models_view, height=28, fg_color=COLORS["field"],
+            border_color=COLORS["border"], bg_color="transparent",
+            show="•", font=ctk.CTkFont("Segoe UI", 11),
+            placeholder_text=f"API key (or set {current_preset.key_env_var} in .env)",
+        )
+        _stored_key = self._provider_config.api_keys.get(
+            self._provider_config.preset, "")
+        if _stored_key:
+            self.provider_key_entry.insert(0, _stored_key)
+        self.provider_key_entry.bind(
+            "<KeyRelease>", lambda _e: self._refresh_provider_key_hint())
+        mwidget(self.provider_key_entry)
+
         # API key status hint (never shows the key itself).
         self._provider_key_hint = ctk.CTkLabel(
             self.models_view, text="", anchor="w",
@@ -1438,6 +1454,15 @@ class ControlBox:
             self.provider_url_entry.delete(0, "end")
             self.provider_url_entry.insert(0, preset.base_url)
             self.provider_url_entry.configure(state="disabled")
+        # Swap the key field to the new preset's stored key + env hint.
+        new_preset = PROVIDER_PRESETS[self._provider_config.preset]
+        self.provider_key_entry.configure(
+            placeholder_text=f"API key (or set {new_preset.key_env_var} in .env)")
+        self.provider_key_entry.delete(0, "end")
+        _stored = self._provider_config.api_keys.get(
+            self._provider_config.preset, "")
+        if _stored:
+            self.provider_key_entry.insert(0, _stored)
         self._provider_config.model = ""
         self.model_entry.delete(0, "end")
         self.model_entry.insert(0, self._provider_config.resolve_model())
@@ -1447,16 +1472,23 @@ class ControlBox:
     def _refresh_provider_key_hint(self) -> None:
         """Show whether the API key is present (never the key value)."""
         from ai_providers import PROVIDER_PRESETS
+        import os
         preset = PROVIDER_PRESETS.get(self._provider_config.preset)
         env_var = preset.key_env_var if preset else "GROQ_API_KEY"
-        import os
-        has_key = bool(os.environ.get(env_var, ""))
-        if has_key:
+        typed = ""
+        entry = getattr(self, "provider_key_entry", None)
+        if entry is not None:
+            typed = entry.get().strip()
+        if typed or self._provider_config.api_key_source() == "custom":
             self._provider_key_hint.configure(
-                text=f"API key: set ({env_var})", text_color=GREEN)
+                text=f"API key: set (entered here — overrides {env_var})",
+                text_color=GREEN)
+        elif os.environ.get(env_var, ""):
+            self._provider_key_hint.configure(
+                text=f"API key: set ({env_var} from .env)", text_color=GREEN)
         else:
             self._provider_key_hint.configure(
-                text=f"API key: not set — add {env_var} to your .env",
+                text=f"API key: not set — paste it above or add {env_var} to .env",
                 text_color=AMBER)
 
     def _on_vad(self, value: float) -> None:
@@ -1500,6 +1532,11 @@ class ControlBox:
                 break
         if self._provider_config.preset == "custom":
             self._provider_config.base_url = self.provider_url_entry.get().strip()
+        typed_key = self.provider_key_entry.get().strip()
+        if typed_key:
+            self._provider_config.api_keys[self._provider_config.preset] = typed_key
+        else:
+            self._provider_config.api_keys.pop(self._provider_config.preset, None)
         self._provider_config.model = cfg.model
         if self.integration is not None:
             self.integration.update_ai_config(
@@ -3002,6 +3039,15 @@ def main(argv=None) -> int:
     # ClearCommit mode config and integration (additive; disabled by default).
     mode_config = ModeConfig.from_dict(saved.get("mode_config", {}))
     integration = ClearCommitIntegration(mode_config=mode_config)
+    # Reconnect a configured AI provider on launch. Previously the provider
+    # only connected when the Models-tab Save button was clicked, so every
+    # restart silently left the AI features inert despite saved settings.
+    integration.update_ai_config(
+        AIModelSettings.from_dict(saved.get("ai_config", {})),
+        sanitize_overrides(saved.get("prompt_overrides", {})),
+        provider_config=ProviderConfig.from_dict(
+            saved.get("provider_config", {})),
+    )
 
     interp = StreamingInterpreter(
         args.person1_lang,

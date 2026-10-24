@@ -183,8 +183,9 @@ The Models tab lets you connect any OpenAI-compatible chat-completions endpoint:
 | Groq | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | `openai/gpt-oss-120b` |
 | Custom | user-supplied | `CUSTOM_AI_API_KEY` | user-supplied |
 
-When a provider is configured (preset + API key present):
+When a provider is configured (preset + API key present — pasted in the Models tab and stored per-preset in settings.json, or via env vars; a pasted key wins):
 - All 4 AI features (Social Coach, Professional Coach, Assistant, Meeting Intelligence) get the real provider
+- The provider is restored automatically on app launch (main() re-applies saved ai_config/prompt_overrides/provider_config)
 - The provider is used for all model calls
 - Model/temperature/max_tokens from the Models tab are passed via the context mechanism
 

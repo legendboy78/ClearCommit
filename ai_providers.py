@@ -17,7 +17,7 @@ Safety:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 import os
 
@@ -72,6 +72,10 @@ class ProviderConfig:
     temperature: float = 0.3
     max_tokens: int = 1024
     timeout_s: float = 15.0
+    #: Per-preset keys entered in the Models tab. Stored in the app settings
+    #: file (plaintext, same trust level as .env). Empty/missing falls back
+    #: to the preset's env var. UI key takes precedence over the env var.
+    api_keys: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data):
@@ -94,17 +98,25 @@ class ProviderConfig:
             timeout_s = 15.0
         base_url = data.get("base_url", "")
         model = data.get("model", "")
+        raw_keys = data.get("api_keys", {})
+        api_keys = {}
+        if isinstance(raw_keys, dict):
+            for k, v in raw_keys.items():
+                if k in PROVIDER_PRESETS and isinstance(v, str) and v.strip():
+                    api_keys[k] = v.strip()
         return cls(
             preset=preset,
             base_url=str(base_url).strip() if isinstance(base_url, str) else "",
             model=str(model).strip() if isinstance(model, str) else "",
             temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s,
+            api_keys=api_keys,
         )
 
     def to_dict(self):
         return {"preset": self.preset, "base_url": self.base_url,
                 "model": self.model, "temperature": self.temperature,
-                "max_tokens": self.max_tokens, "timeout_s": self.timeout_s}
+                "max_tokens": self.max_tokens, "timeout_s": self.timeout_s,
+                "api_keys": dict(self.api_keys)}
 
     def resolve_base_url(self):
         if self.base_url:
@@ -119,8 +131,24 @@ class ProviderConfig:
         return p.default_model if p else ""
 
     def resolve_api_key(self):
+        typed = ""
+        if isinstance(self.api_keys, dict):
+            typed = str(self.api_keys.get(self.preset, "") or "").strip()
+        if typed:
+            return typed
         p = PROVIDER_PRESETS.get(self.preset)
         return os.environ.get(p.key_env_var if p else "GROQ_API_KEY", "")
+
+    def api_key_source(self):
+        """'custom' when a UI-entered key is active, 'env' when the env var
+        is used, '' when no key is available for the current preset."""
+        if isinstance(self.api_keys, dict) and \
+                str(self.api_keys.get(self.preset, "") or "").strip():
+            return "custom"
+        p = PROVIDER_PRESETS.get(self.preset)
+        if p and os.environ.get(p.key_env_var, ""):
+            return "env"
+        return ""
 
     def is_configured(self):
         return bool(self.resolve_base_url() and self.resolve_api_key()

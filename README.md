@@ -22,13 +22,13 @@ Real-time two-way interpreter with AI-powered communication coaching and meeting
 
 The Models tab (in the AI workspace) lets you connect a provider for Coach, Assistant, and Meeting Intelligence:
 
-| Provider | API Key | Get it at |
-|----------|---------|-----------|
-| **Groq** | `GROQ_API_KEY` | https://console.groq.com/keys (free) |
-| **OpenRouter** | `OPENROUTER_API_KEY` | https://openrouter.ai/keys |
-| **Custom** | `CUSTOM_AI_API_KEY` | Any OpenAI-compatible endpoint |
+| Provider | Get your key at |
+|----------|-----------------|
+| **Groq** | https://console.groq.com/keys (free) |
+| **OpenRouter** | https://openrouter.ai/keys |
+| **Custom** | Any OpenAI-compatible endpoint |
 
-Pick a provider in the Models tab, confirm the key hint is green, Save. All AI features go live.
+Pick a provider in the Models tab, paste its API key in the **API key** field (masked; saved to your app settings — no `.env` editing needed), confirm the key hint is green, Save. All AI features go live. Keys can alternatively be set as env vars (`GROQ_API_KEY` / `OPENROUTER_API_KEY` / `CUSTOM_AI_API_KEY`); a pasted key takes precedence.
 
 ## Audio Setup (for Discord calls)
 
