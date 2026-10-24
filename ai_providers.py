@@ -20,8 +20,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 import os
+import time
 
 import requests
+
+#: Transient HTTP statuses worth one bounded retry (free-tier rate limits and
+#: gateway hiccups fail fast, so the retry adds ~2s, well inside AIService
+#: request timeouts).
+_RETRY_STATUS = {429, 502, 503, 504}
+_RETRY_BACKOFF_S = 1.5
 
 
 @dataclass(frozen=True)
@@ -180,8 +187,14 @@ class OpenAICompatibleProvider:
                    "Content-Type": "application/json"}
         payload = {"model": cfg.resolve_model(), "messages": messages,
                    "temperature": cfg.temperature, "max_tokens": cfg.max_tokens}
-        resp = self._session.post(url, json=payload, headers=headers,
-                                  timeout=cfg.timeout_s)
+        resp = None
+        for attempt in range(2):
+            resp = self._session.post(url, json=payload, headers=headers,
+                                      timeout=cfg.timeout_s)
+            if resp.status_code in _RETRY_STATUS and attempt == 0:
+                time.sleep(_RETRY_BACKOFF_S)
+                continue
+            break
         if resp.status_code == 429:
             raise RuntimeError("rate_limited")
         if resp.status_code == 401:

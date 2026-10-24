@@ -1584,8 +1584,21 @@ class ControlBox:
             elif str(err).startswith("fabricated_evidence"):
                 line = ("The assistant referenced transcript evidence that "
                         "does not exist — answer discarded.")
-            elif err == "provider_error":
-                line = "The assistant failed to answer. Try again."
+            elif str(err).startswith("provider_error"):
+                detail = str(err).split(":", 1)[1] if ":" in str(err) else ""
+                if detail == "rate_limited":
+                    line = ("The AI provider is rate-limiting you — free "
+                            "models are the strictest. Wait a few seconds and "
+                            "try again.")
+                elif detail == "invalid_api_key":
+                    line = ("The provider rejected the API key — check it in "
+                            "the Models tab and Save.")
+                elif detail.startswith("api_key_not_set"):
+                    line = ("No API key for this provider yet — paste one in "
+                            "the Models tab and Save.")
+                else:
+                    line = ("Assistant provider error"
+                            + (f" ({detail})." if detail else " — try again."))
             elif err in ("provider_timeout", "request_cancelled"):
                 line = "The assistant took too long — try again."
             else:

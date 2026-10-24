@@ -156,6 +156,93 @@ def test_integration_connects_provider_from_ui_key():
         r()
 
 
+def _fake_session(responses):
+    """Session stand-in whose post() pops canned (status, json) responses."""
+    import ai_providers
+
+    class FakeResponse:
+        def __init__(self, status, body):
+            self.status_code = status
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            self.calls += 1
+            status, body = responses[min(self.calls - 1, len(responses) - 1)]
+            return FakeResponse(status, body)
+
+    return FakeSession()
+
+
+def _no_sleep(monkeypatch):
+    monkeypatch.setattr("ai_providers.time.sleep", lambda _s: None)
+
+
+def test_retry_on_429_then_success(monkeypatch):
+    from ai_providers import OpenAICompatibleProvider, ProviderConfig
+    _no_sleep(monkeypatch)
+    r = _set_env("OPENROUTER_API_KEY", None)
+    try:
+        cfg = ProviderConfig(preset="openrouter",
+                             api_keys={"openrouter": "or_test"})
+        prov = OpenAICompatibleProvider(cfg)
+        session = _fake_session([
+            (429, {}), (200, {"choices": [{"message": {"content": " hi "}}]}),
+        ])
+        prov._session = session
+        out = prov._chat("sys", "hello")
+        assert out == "hi"
+        assert session.calls == 2  # one retry after the 429
+    finally:
+        r()
+
+
+def test_rate_limited_after_two_429s(monkeypatch):
+    from ai_providers import OpenAICompatibleProvider, ProviderConfig
+    _no_sleep(monkeypatch)
+    r = _set_env("OPENROUTER_API_KEY", None)
+    try:
+        cfg = ProviderConfig(preset="openrouter",
+                             api_keys={"openrouter": "or_test"})
+        prov = OpenAICompatibleProvider(cfg)
+        session = _fake_session([(429, {})])
+        prov._session = session
+        try:
+            prov._chat("sys", "hello")
+            assert False, "expected rate_limited"
+        except RuntimeError as exc:
+            assert str(exc) == "rate_limited"
+        assert session.calls == 2  # exactly one retry, then raise
+    finally:
+        r()
+
+
+def test_401_never_retried(monkeypatch):
+    from ai_providers import OpenAICompatibleProvider, ProviderConfig
+    _no_sleep(monkeypatch)
+    r = _set_env("OPENROUTER_API_KEY", None)
+    try:
+        cfg = ProviderConfig(preset="openrouter",
+                             api_keys={"openrouter": "or_test"})
+        prov = OpenAICompatibleProvider(cfg)
+        session = _fake_session([(401, {})])
+        prov._session = session
+        try:
+            prov._chat("sys", "hello")
+            assert False, "expected invalid_api_key"
+        except RuntimeError as exc:
+            assert str(exc) == "invalid_api_key"
+        assert session.calls == 1  # auth failures are not transient
+    finally:
+        r()
+
+
 if __name__ == "__main__":
     test_defaults_have_no_ui_keys()
     test_from_dict_parses_and_strips_ui_keys()
@@ -168,4 +255,7 @@ if __name__ == "__main__":
     test_is_configured_with_ui_key_and_no_env()
     test_missing_key_everywhere_is_unconfigured()
     test_integration_connects_provider_from_ui_key()
+    test_retry_on_429_then_success()
+    test_rate_limited_after_two_429s()
+    test_401_never_retried()
     print("\nAll ai_providers tests passed.")

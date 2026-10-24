@@ -95,9 +95,21 @@ def test_provider_exception_graceful():
     a = ConversationAssistant(provider=p)
     r = a.ask("q", evidence_map=_ctx_map(3))
     assert r.ok is False
-    assert r.error == "provider_error"
+    assert r.error.startswith("provider_error")
     assert a.history() == []
     print("PASS test_provider_exception_graceful")
+
+
+def test_provider_error_detail_preserved():
+    class RateLimitedProvider(FakeAssistantProvider):
+        def answer(self, question, context, history=None):
+            raise RuntimeError("rate_limited")
+
+    a = ConversationAssistant(provider=RateLimitedProvider())
+    r = a.ask("q", evidence_map=_ctx_map(3))
+    assert r.ok is False
+    assert r.error == "provider_error:rate_limited"  # GUI maps this to a hint
+    print("PASS test_provider_error_detail_preserved")
 
 
 def test_empty_and_oversized_questions():
@@ -156,6 +168,7 @@ if __name__ == "__main__":
     test_fabricated_citation_rejected()
     test_uncited_reply_allowed()
     test_provider_exception_graceful()
+    test_provider_error_detail_preserved()
     test_empty_and_oversized_questions()
     test_history_bounded()
     test_clear_history()

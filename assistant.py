@@ -24,10 +24,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional, Protocol
+import logging
 import re
 from collections import deque
 
 from meeting_intelligence import EvidenceReference
+
+logger = logging.getLogger(__name__)
 
 
 class AssistantProvider(Protocol):
@@ -217,9 +220,12 @@ class ConversationAssistant:
         history = self.history()
         try:
             reply = provider.answer(question, context, history)
-        except Exception:  # noqa: BLE001 - provider failures are non-fatal
+        except Exception as exc:  # noqa: BLE001 - provider failures are non-fatal
+            # Keep the failure reason: the UI maps it to an actionable message
+            # (rate limit, bad key, ...) and the log records it for diagnosis.
+            logger.warning("Assistant provider failure: %s", exc)
             return AssistantReply(
-                ok=False, error="provider_error",
+                ok=False, error=f"provider_error:{exc}",
                 reply="The assistant failed to answer. Try again.",
                 context_uids=context_uids,
             )
